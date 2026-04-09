@@ -1,0 +1,174 @@
+"""ONNX model loading, shape inference, and topological sorting."""
+
+from pathlib import Path
+
+import onnx
+from onnx import helper as onnx_helper
+from onnx import numpy_helper, shape_inference
+
+from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
+
+
+def _extract_shape(type_proto: onnx.TypeProto) -> tuple[int, ...]:
+    """Extract concrete shape from an ONNX TypeProto, treating dynamic dims as 1."""
+    tensor_type = type_proto.tensor_type
+    if not tensor_type.HasField("shape"):
+        return ()
+    dims: list[int] = []
+    for d in tensor_type.shape.dim:
+        if d.dim_value > 0:
+            dims.append(d.dim_value)
+        else:
+            # Dynamic / symbolic dimension - default to 1 for memory estimation
+            dims.append(1)
+    return tuple(dims)
+
+
+def _extract_dtype(type_proto: onnx.TypeProto) -> int:
+    return type_proto.tensor_type.elem_type
+
+
+def load_model(path: str | Path) -> AnalyzedGraph:
+    """Load an ONNX model and return a partially populated AnalyzedGraph.
+
+    Runs shape inference, extracts operators and tensor metadata,
+    performs a DFS topological sort favouring early tensor consumption.
+    """
+    model = onnx.load(str(path))
+    try:
+        model = shape_inference.infer_shapes(model, data_prop=True)
+    except Exception:
+        # Some models fail full data propagation; try without
+        model = shape_inference.infer_shapes(model)
+
+    graph = model.graph
+    ag = AnalyzedGraph()
+    ag.model_name = Path(path).stem
+
+    # --- Collect initializers (constants / weights) -----------------------
+    initializer_names: set[str] = set()
+    for init in graph.initializer:
+        shape = tuple(init.dims)
+        ag.tensors[init.name] = TensorInfo(
+            name=init.name,
+            shape=shape,
+            dtype=init.data_type,
+            is_constant=True,
+        )
+        initializer_names.add(init.name)
+        ag.weight_data[init.name] = numpy_helper.to_array(init)
+
+    # --- Collect value_info (intermediate tensors with inferred shapes) ---
+    for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+        if vi.name in ag.tensors:
+            continue
+        ag.tensors[vi.name] = TensorInfo(
+            name=vi.name,
+            shape=_extract_shape(vi.type),
+            dtype=_extract_dtype(vi.type),
+            is_constant=vi.name in initializer_names,
+        )
+
+    # --- Model inputs / outputs -------------------------------------------
+    ag.model_inputs = [
+        inp.name for inp in graph.input if inp.name not in initializer_names
+    ]
+    ag.model_outputs = [out.name for out in graph.output]
+
+    # --- Build OpNodes ----------------------------------------------------
+    nodes_by_output: dict[str, int] = {}  # tensor_name -> node index
+    raw_nodes: list[OpNode] = []
+    for i, node in enumerate(graph.node):
+        name = node.name or f"{node.op_type}_{i}"
+        attrs: dict = {}
+        for attr in node.attribute:
+            val = onnx_helper.get_attribute_value(attr)
+            # Convert bytes to str for cleaner downstream usage
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="replace")
+            # Convert repeated ints/floats to plain lists
+            elif hasattr(val, "__len__") and not isinstance(val, str):
+                val = list(val)
+            attrs[attr.name] = val
+        op = OpNode(
+            name=name,
+            op_type=node.op_type,
+            inputs=list(node.input),
+            outputs=list(node.output),
+            attrs=attrs,
+        )
+        raw_nodes.append(op)
+        for out in node.output:
+            nodes_by_output[out] = i
+
+    # --- DFS topological sort (prefer early consumption) ------------------
+    ag.ops = _topo_sort(raw_nodes, nodes_by_output, initializer_names, ag.model_inputs)
+
+    return ag
+
+
+def _topo_sort(
+    nodes: list[OpNode],
+    tensor_to_producer: dict[str, int],
+    constants: set[str],
+    model_inputs: list[str],
+) -> list[OpNode]:
+    """DFS-based topological sort.
+
+    Visits children in reverse order so that the first consumer of a tensor
+    appears earliest - this tends to reduce peak live memory by freeing
+    tensors sooner.
+    """
+    n = len(nodes)
+    # Build adjacency: producer_idx -> list[consumer_idx]
+    children: list[list[int]] = [[] for _ in range(n)]
+    for idx, node in enumerate(nodes):
+        for inp in node.inputs:
+            if inp in constants or inp in model_inputs or inp == "":
+                continue
+            producer = tensor_to_producer.get(inp)
+            if producer is not None and producer != idx:
+                children[producer].append(idx)
+
+    # Also build in-degree for cycle-safety
+    in_degree = [0] * n
+    for idx, node in enumerate(nodes):
+        for inp in node.inputs:
+            if inp in constants or inp in model_inputs or inp == "":
+                continue
+            producer = tensor_to_producer.get(inp)
+            if producer is not None and producer != idx:
+                in_degree[idx] += 1
+
+    # DFS post-order, then reverse
+    visited = [False] * n
+    order: list[int] = []
+
+    def dfs(idx: int) -> None:
+        visited[idx] = True
+        # Visit children in reverse so first child ends up earliest in final order
+        for child in reversed(children[idx]):
+            if not visited[child]:
+                dfs(child)
+        order.append(idx)
+
+    # Start from roots (nodes with in_degree 0)
+    roots = [i for i in range(n) if in_degree[i] == 0]
+    for r in roots:
+        if not visited[r]:
+            dfs(r)
+
+    # Any unvisited (e.g. cycles or disconnected) - append in original order
+    for i in range(n):
+        if not visited[i]:
+            order.append(i)
+
+    order.reverse()
+
+    # Assign step indices and return
+    sorted_ops: list[OpNode] = []
+    for step, idx in enumerate(order):
+        node = nodes[idx]
+        node.step = step
+        sorted_ops.append(node)
+    return sorted_ops

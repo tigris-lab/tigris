@@ -1,0 +1,243 @@
+"""Tests for fused activation absorption pass."""
+
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+from tigris.emitters.binary.defs import ACT_RELU, OP_TYPE_MAP
+from tigris.emitters.binary.reader import read_binary_plan
+from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.loaders import load_model
+
+
+# Helpers
+
+
+def _make_model(nodes, name, X, Y, initializers=None):
+    graph = helper.make_graph(nodes, name, [X], [Y], initializer=initializers or [])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    return model
+
+
+def _save_and_load(model, tmp_path, filename="model.onnx"):
+    path = tmp_path / filename
+    onnx.save(model, str(path))
+    return load_model(path)
+
+
+# Conv -> Relu fusion
+
+
+def test_conv_relu_fused(tmp_path):
+    """Conv followed by Relu should be fused into one op."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
+                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
+                           np.zeros(4, dtype=np.float32).tolist())
+
+    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
+                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+
+    model = _make_model([conv, relu], "conv_relu", X, Y, [w, b])
+    ag = _save_and_load(model, tmp_path)
+
+    assert len(ag.ops) == 1
+    assert ag.ops[0].op_type == "Conv"
+    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
+    assert ag.ops[0].outputs == ["output"]
+    assert "t0" not in ag.tensors
+
+
+def test_conv_relu6_fused(tmp_path):
+    """Conv followed by Relu6 (from Clip(0,6)) should be fused."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
+                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
+                           np.zeros(4, dtype=np.float32).tolist())
+
+    min_val = numpy_helper.from_array(np.array([0.0], dtype=np.float32), "clip_min")
+    max_val = numpy_helper.from_array(np.array([6.0], dtype=np.float32), "clip_max")
+
+    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
+                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+    clip = helper.make_node("Clip", ["t0", "clip_min", "clip_max"], ["output"], name="clip0")
+
+    model = _make_model([conv, clip], "conv_relu6", X, Y, [w, b, min_val, max_val])
+    ag = _save_and_load(model, tmp_path)
+
+    assert len(ag.ops) == 1
+    assert ag.ops[0].op_type == "Conv"
+    assert ag.ops[0].attrs.get("fused_activation") == "Relu6"
+
+
+def test_depthwise_relu_fused(tmp_path):
+    """DepthwiseConv followed by Relu should be fused."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    # Depthwise: group=4, weight shape [4, 1, 3, 3]
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 1, 3, 3],
+                           np.zeros((4, 1, 3, 3), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
+                           np.zeros(4, dtype=np.float32).tolist())
+
+    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="dw0",
+                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0], group=4)
+    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+
+    model = _make_model([conv, relu], "dw_relu", X, Y, [w, b])
+    ag = _save_and_load(model, tmp_path)
+
+    assert len(ag.ops) == 1
+    assert ag.ops[0].op_type == "DepthwiseConv"
+    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
+
+
+def test_gemm_relu_fused(tmp_path):
+    """Gemm followed by Relu should be fused."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 16])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [8, 16],
+                           np.zeros((8, 16), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [8],
+                           np.zeros(8, dtype=np.float32).tolist())
+
+    gemm = helper.make_node("Gemm", ["input", "w", "b"], ["t0"], name="gemm0",
+                            transB=1)
+    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+
+    model = _make_model([gemm, relu], "gemm_relu", X, Y, [w, b])
+    ag = _save_and_load(model, tmp_path)
+
+    assert len(ag.ops) == 1
+    assert ag.ops[0].op_type == "Gemm"
+    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
+
+
+# Cases that should NOT fuse
+
+
+def test_add_relu_not_fused(tmp_path):
+    """Add followed by Relu should NOT be fused (Add not in fusable set)."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [1, 64],
+                           np.zeros((1, 64), dtype=np.float32).flatten().tolist())
+
+    add = helper.make_node("Add", ["input", "w"], ["t0"], name="add0")
+    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+
+    model = _make_model([add, relu], "add_relu", X, Y, [w])
+    ag = _save_and_load(model, tmp_path)
+
+    assert len(ag.ops) == 2
+    assert ag.ops[0].op_type == "Add"
+    assert ag.ops[1].op_type == "Relu"
+
+
+def test_conv_two_consumers_not_fused(tmp_path):
+    """Conv whose output feeds both Relu and another op should NOT be fused."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
+                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
+                           np.zeros(4, dtype=np.float32).tolist())
+
+    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
+                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    # Second consumer of t0
+    add = helper.make_node("Add", ["t1", "t0"], ["output"], name="add0")
+
+    model = _make_model([conv, relu, add], "conv_branch", X, Y, [w, b])
+    ag = _save_and_load(model, tmp_path)
+
+    # Conv should not be fused because t0 has two consumers
+    conv_op = [op for op in ag.ops if op.op_type == "Conv"][0]
+    assert conv_op.attrs.get("fused_activation") is None
+
+
+# Step indices contiguous
+
+
+def test_step_indices_contiguous(tmp_path):
+    """After fusion, step indices should be 0, 1, 2, ... without gaps."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    w0 = helper.make_tensor("w0", TensorProto.FLOAT, [4, 3, 3, 3],
+                            np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b0 = helper.make_tensor("b0", TensorProto.FLOAT, [4],
+                            np.zeros(4, dtype=np.float32).tolist())
+    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [4, 4, 3, 3],
+                            np.zeros((4, 4, 3, 3), dtype=np.float32).flatten().tolist())
+    b1 = helper.make_tensor("b1", TensorProto.FLOAT, [4],
+                            np.zeros(4, dtype=np.float32).tolist())
+
+    conv0 = helper.make_node("Conv", ["input", "w0", "b0"], ["t0"], name="conv0",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    conv1 = helper.make_node("Conv", ["t1", "w1", "b1"], ["output"], name="conv1",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+
+    model = _make_model([conv0, relu, conv1], "conv_relu_conv", X, Y, [w0, b0, w1, b1])
+    ag = _save_and_load(model, tmp_path)
+
+    # Relu absorbed -> 2 ops
+    assert len(ag.ops) == 2
+    for i, op in enumerate(ag.ops):
+        assert op.step == i
+
+
+# Binary round-trip
+
+
+def test_binary_roundtrip_preserves_fused_act(tmp_path):
+    """fused_act field survives binary serialization round-trip."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
+                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
+                           np.zeros(4, dtype=np.float32).tolist())
+
+    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
+                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
+    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+
+    model = _make_model([conv, relu], "conv_relu_rt", X, Y, [w, b])
+    ag = _save_and_load(model, tmp_path)
+
+    # Pipeline for binary
+    from tigris.analysis.lifetime import compute_lifetimes
+    from tigris.analysis.memory import compute_memory_timeline
+    from tigris.analysis.partition_temporal import partition_temporal
+    from tigris.analysis.partition_spatial import partition_spatial
+
+    ag = compute_lifetimes(ag)
+    ag = compute_memory_timeline(ag)
+    ag = partition_temporal(ag, 4096)
+    ag = partition_spatial(ag)
+
+    data = emit_binary_bytes(ag)
+    plan = read_binary_plan(data)
+
+    assert plan["num_ops"] == 1
+    conv_op = plan["ops"][0]
+    assert conv_op["op_type"] == OP_TYPE_MAP["Conv"]
+    assert conv_op["fused_act"] == ACT_RELU
+    assert conv_op["act_min"] == -128
+    assert conv_op["act_max"] == 127
