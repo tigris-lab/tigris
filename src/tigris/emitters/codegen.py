@@ -170,7 +170,8 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
         dispatch = "tigris_dispatch_kernel_esp_nn"
         kernel_includes = """\
 #include "tigris_kernels_esp_nn.h"
-#include "tigris_kernels_s8.h\""""
+#include "tigris_kernels_s8.h"
+"""
         prepare_block = """\
 
     /* ESP-NN scratch buffer setup */

@@ -65,7 +65,7 @@ Several kernel backends are available (portable C99, ESP32 family, Cortex-M fami
 `tigris codegen` produces a small C harness that locates the plan on flash at runtime and hands it to the runtime:
 
 - declarations for the input/output buffers and the arena
-- a `tigris_run_once()` entry point that sets up memory and calls the runtime
+- a target entry point (`app_main()` for ESP-IDF, `main()` for POSIX/Cortex-M examples) that sets up memory and calls the runtime
 - backend-specific glue for finding the plan: partition mmap on ESP-IDF, an `extern` flash symbol on Cortex-M, a file path on POSIX
 
 Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your chosen kernel library, flash the `.tgrs` alongside the firmware, and you have a working inference binary.
